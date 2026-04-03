@@ -1,0 +1,10 @@
+type: yolov8_seg
+name: flatbug
+display_name: flatbugM
+provider: Ultralytics
+model_path: "C:/Users/andre/Documents/GitHub/ComputerVisionDetectionToy/customModel/flat_bug_M.onnx"
+iou_threshold: 0.45
+conf_threshold: 0.25
+max_det: 500
+classes:
+  - creature
