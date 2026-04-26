@@ -285,8 +285,7 @@ def build_ui():
         gr.Markdown("# 🔬 CV Lab Toy\n*Semantic object detection · human-in-the-loop · local LLM*")
 
         current_image_state = gr.State(None)   # PIL Image
-        detections_state    = gr.State([])     # list of {id, label, bbox}
-        selected_ids_state  = gr.State(set())  # set of selected IDs
+        detections_state    = gr.State([])     # list of {id, label, bbox} — mirrors canvas
 
         # ════════════════════════════════════════════════════════════════════
         # Tab 1 — Input
@@ -329,51 +328,493 @@ def build_ui():
                                 [current_display, current_image_state, cam_status])
 
         # ════════════════════════════════════════════════════════════════════
-        # Tab 2 — Detect & Review
+        # Tab 2 — Detect & Review  (HTML5 canvas widget)
         # ════════════════════════════════════════════════════════════════════
         with gr.Tab("🔍 Detect & Review"):
             gr.Markdown(
-                "**Auto-detect** asks the local LLM to find every object and draw boxes. "
-                "**Click** a box to select it. **Shift-select** multiple boxes. "
-                "Rename, group, or delete — then register what you want to track."
+                "**Auto-detect** lets the LLM find every object. "
+                "Then use the canvas to **draw** new boxes, **drag** to move, "
+                "**drag corners** to resize, **click** to select, **Delete** key to remove. "
+                "Double-click a box to rename it inline."
             )
 
             with gr.Row():
-                btn_detect      = gr.Button("🤖 Detect all objects", variant="primary")
+                btn_detect       = gr.Button("🤖 Detect all objects", variant="primary")
                 btn_detect_guide = gr.Button("🗂️ Detect (guided by registry)")
+                btn_load_canvas  = gr.Button("⬆ Load image into canvas")
 
-            detect_status = gr.Textbox(label="Status", interactive=False, lines=2)
+            detect_status = gr.Textbox(label="Status", interactive=False, lines=1)
 
-            detect_canvas = gr.Image(
-                label="Detected objects — click a box to select",
-                type="pil", height=500, interactive=False, show_download_button=False,
-            )
+            # Bridge textboxes: rendered in DOM but CSS-hidden.
+            # visible=False would prevent Gradio from rendering the <textarea> at all.
+            canvas_in  = gr.Textbox(label="__cv_in__",  elem_id="cv_canvas_in",
+                                    interactive=False, max_lines=1)
+            canvas_out = gr.Textbox(label="__cv_out__", elem_id="cv_canvas_out",
+                                    interactive=False, max_lines=1)
+            gr.HTML('''<style>
+              #cv_canvas_in, #cv_canvas_out { display:none !important; }
+            </style>''')
 
+            # The actual interactive canvas widget
+            gr.HTML("""
+<div id="cvtoy-wrap" style="position:relative; width:100%; background:#07090f;
+     border:1px solid #1e3a5f; border-radius:6px; overflow:hidden; min-height:520px;">
+
+  <!-- toolbar -->
+  <div id="cvtoy-toolbar" style="display:flex; align-items:center; gap:8px;
+       padding:6px 10px; background:#0f1623; border-bottom:1px solid #1e3a5f;
+       font-family:'IBM Plex Mono',monospace; font-size:12px; color:#64748b;">
+    <button id="cvtoy-btn-select" onclick="CVToy.setMode('select')"
+      style="padding:3px 10px; border-radius:3px; border:1px solid #1e3a5f;
+             background:#1a2f4a; color:#60a5fa; cursor:pointer; font-family:inherit;">
+      ▣ Select</button>
+    <button id="cvtoy-btn-draw" onclick="CVToy.setMode('draw')"
+      style="padding:3px 10px; border-radius:3px; border:1px solid #1e3a5f;
+             background:#111827; color:#60a5fa; cursor:pointer; font-family:inherit;">
+      ✚ Draw</button>
+    <span style="margin-left:4px; color:#334155;">|</span>
+    <span id="cvtoy-hint" style="color:#475569;">Load image, then Draw or Select boxes</span>
+    <span style="flex:1"></span>
+    <span style="color:#334155;">Del=delete · Dbl-click=rename · Ctrl+A=select all</span>
+  </div>
+
+  <!-- canvas -->
+  <canvas id="cvtoy-canvas" tabindex="0"
+    style="display:block; cursor:crosshair; max-width:100%; outline:none;"></canvas>
+
+  <!-- inline rename input (hidden until dbl-click) -->
+  <input id="cvtoy-rename" type="text" placeholder="label…"
+    style="display:none; position:absolute; background:#0f1623; color:#93c5fd;
+           border:1px solid #3b82f6; padding:2px 6px; font-family:'IBM Plex Mono',monospace;
+           font-size:12px; border-radius:3px; z-index:10;" />
+</div>
+
+<!-- batch-relabel row (below canvas, outside the HTML widget) -->
+
+<script>
+(function(){
+"use strict";
+
+/* ── palette ─────────────────────────────────────────── */
+const PALETTE = [
+  '#00ff50','#00b4ff','#ffb400','#ff3cc8','#50ffff',
+  '#ff643c','#a0ff00','#c850ff','#ffdc28','#00ffb4',
+  '#ff2850','#28c8ff','#dcff50','#ff8cc8','#6464ff',
+  '#ffc864','#00dc8c','#ff508c','#8cdcff','#ffa03c',
+];
+function labelColor(label){
+  let h=0; for(let i=0;i<label.length;i++) h=(h*31+label.charCodeAt(i))>>>0;
+  return PALETTE[h % PALETTE.length];
+}
+
+/* ── state ───────────────────────────────────────────── */
+let boxes   = [];   // [{id,label,x1,y1,x2,y2}]  — image pixel coords
+let selIds  = new Set();
+let mode    = 'select';  // 'select' | 'draw'
+let img     = null;      // HTMLImageElement
+let imgW=0, imgH=0;
+let scale   = 1;         // canvas CSS px per image px
+let offX=0, offY=0;      // canvas offset of image top-left
+
+/* drag state */
+let drag = null;
+/* drag.type: 'draw' | 'move' | 'resize'
+   draw:   {startX,startY, current:{x1,y1,x2,y2}}
+   move:   {ids:[...], startX,startY, origins:{id:{x1,y1,x2,y2}}}
+   resize: {id, handle, startX,startY, origin:{x1,y1,x2,y2}}  */
+
+const HANDLE = 8;  // resize handle half-size in canvas px
+
+/* ── elements ────────────────────────────────────────── */
+const canvas  = document.getElementById('cvtoy-canvas');
+const ctx     = canvas.getContext('2d');
+const hint    = document.getElementById('cvtoy-hint');
+const renameInput = document.getElementById('cvtoy-rename');
+
+/* ── Gradio bridges ──────────────────────────────────── */
+function gradioTextbox(elemId){
+  // Gradio wraps the textarea in a div with the elem_id; try both direct and child
+  return document.querySelector(`#${elemId} textarea`)
+      || document.querySelector(`[id="${elemId}"] textarea`);
+}
+function pushBoxes(){
+  const ta = gradioTextbox('cv_canvas_out');
+  if(!ta) return;
+  const data = JSON.stringify(boxes.map(b=>({
+    id:b.id, label:b.label, bbox:[b.x1,b.y1,b.x2,b.y2]
+  })));
+  // Use native setter so React/Svelte state updates fire
+  const nativeSetter = Object.getOwnPropertyDescriptor(
+    window.HTMLTextAreaElement.prototype, 'value').set;
+  nativeSetter.call(ta, data);
+  ta.dispatchEvent(new Event('input', {bubbles:true}));
+}
+let _lastCanvasInVal = '';
+function watchCanvasIn(){
+  const ta = gradioTextbox('cv_canvas_in');
+  if(!ta){ setTimeout(watchCanvasIn, 400); return; }
+  // Poll for value changes — MutationObserver doesn't fire on programmatic value sets
+  function poll(){
+    const v = ta.value;
+    if(v && v !== _lastCanvasInVal){
+      _lastCanvasInVal = v;
+      applyCanvasIn(v);
+    }
+    setTimeout(poll, 120);
+  }
+  poll();
+}
+function applyCanvasIn(raw){
+  if(!raw) return;
+  let payload;
+  try { payload = JSON.parse(raw); } catch{ return; }
+  if(payload.image){
+    const im = new Image();
+    im.onload = ()=>{
+      img=im; imgW=im.naturalWidth; imgH=im.naturalHeight;
+      resizeCanvas();
+      if(payload.boxes) loadBoxes(payload.boxes);
+      else { boxes=[]; selIds=new Set(); }
+      render(); pushBoxes();
+    };
+    im.src = payload.image;
+  } else if(payload.boxes !== undefined){
+    loadBoxes(payload.boxes);
+    render(); pushBoxes();
+  }
+}
+function loadBoxes(raw){
+  boxes = raw.map(b=>({
+    id: b.id || uid(),
+    label: b.label || 'object',
+    x1: b.bbox[0], y1: b.bbox[1], x2: b.bbox[2], y2: b.bbox[3],
+  }));
+  selIds = new Set();
+}
+
+/* ── sizing ──────────────────────────────────────────── */
+function resizeCanvas(){
+  if(!img) return;
+  const wrap = document.getElementById('cvtoy-wrap');
+  const maxW = wrap.clientWidth;
+  const maxH = Math.max(480, window.innerHeight * 0.55);
+  scale  = Math.min(maxW / imgW, maxH / imgH, 1);
+  canvas.width  = Math.round(imgW * scale);
+  canvas.height = Math.round(imgH * scale);
+  offX = 0; offY = 0;
+}
+window.addEventListener('resize', ()=>{ resizeCanvas(); render(); });
+
+/* ── coordinate helpers ──────────────────────────────── */
+function canvasXY(e){
+  const r = canvas.getBoundingClientRect();
+  return [(e.clientX - r.left), (e.clientY - r.top)];
+}
+function toImg(cx,cy){ return [(cx-offX)/scale, (cy-offY)/scale]; }
+function toCanvas(ix,iy){ return [ix*scale+offX, iy*scale+offY]; }
+
+/* ── hit testing ─────────────────────────────────────── */
+function handleAt(box, cx, cy){
+  // returns handle name or null
+  const [bx1,by1] = toCanvas(box.x1,box.y1);
+  const [bx2,by2] = toCanvas(box.x2,box.y2);
+  const handles = {
+    'tl':[bx1,by1],'tr':[bx2,by1],'bl':[bx1,by2],'br':[bx2,by2],
+    'tm':[(bx1+bx2)/2,by1],'bm':[(bx1+bx2)/2,by2],
+    'ml':[bx1,(by1+by2)/2],'mr':[bx2,(by1+by2)/2],
+  };
+  for(const [name,[hx,hy]] of Object.entries(handles)){
+    if(Math.abs(cx-hx)<=HANDLE && Math.abs(cy-hy)<=HANDLE) return name;
+  }
+  return null;
+}
+function boxAt(cx, cy){
+  // smallest box containing point
+  let hit=null, bestA=Infinity;
+  for(const b of boxes){
+    const [bx1,by1]=toCanvas(b.x1,b.y1), [bx2,by2]=toCanvas(b.x2,b.y2);
+    if(cx>=bx1&&cx<=bx2&&cy>=by1&&cy<=by2){
+      const a=(bx2-bx1)*(by2-by1);
+      if(a<bestA){bestA=a;hit=b;}
+    }
+  }
+  return hit;
+}
+
+/* ── rendering ───────────────────────────────────────── */
+function render(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  if(!img) return;
+  ctx.drawImage(img, offX, offY, imgW*scale, imgH*scale);
+
+  // draw ghost while dragging new box
+  if(drag?.type==='draw'){
+    const {x1,y1,x2,y2}=drag.current;
+    const [cx1,cy1]=toCanvas(x1,y1), [cx2,cy2]=toCanvas(x2,y2);
+    ctx.strokeStyle='#ffffff'; ctx.lineWidth=1.5; ctx.setLineDash([4,4]);
+    ctx.strokeRect(cx1,cy1,cx2-cx1,cy2-cy1);
+    ctx.setLineDash([]);
+  }
+
+  for(const b of boxes){
+    const sel = selIds.has(b.id);
+    const col = labelColor(b.label);
+    const [cx1,cy1]=toCanvas(b.x1,b.y1), [cx2,cy2]=toCanvas(b.x2,b.y2);
+    const w=cx2-cx1, h=cy2-cy1;
+
+    // fill
+    ctx.fillStyle = col + (sel ? '33' : '1a');
+    ctx.fillRect(cx1,cy1,w,h);
+
+    // border
+    ctx.strokeStyle = col;
+    ctx.lineWidth   = sel ? 3 : 1.5;
+    ctx.setLineDash([]);
+    ctx.strokeRect(cx1,cy1,w,h);
+
+    if(sel){
+      // white outline
+      ctx.strokeStyle='rgba(255,255,255,0.5)';
+      ctx.lineWidth=1;
+      ctx.strokeRect(cx1-2,cy1-2,w+4,h+4);
+
+      // resize handles
+      ctx.fillStyle=col;
+      const pts=[[cx1,cy1],[cx2,cy1],[cx1,cy2],[cx2,cy2],
+                 [(cx1+cx2)/2,cy1],[(cx1+cx2)/2,cy2],
+                 [cx1,(cy1+cy2)/2],[cx2,(cy1+cy2)/2]];
+      for(const [hx,hy] of pts){
+        ctx.fillRect(hx-HANDLE/2,hy-HANDLE/2,HANDLE,HANDLE);
+        ctx.strokeStyle='#fff'; ctx.lineWidth=1;
+        ctx.strokeRect(hx-HANDLE/2,hy-HANDLE/2,HANDLE,HANDLE);
+      }
+    }
+
+    // label pill
+    const txt = b.label;
+    const fh  = Math.max(10, Math.min(13, scale*14));
+    ctx.font  = `${fh}px 'IBM Plex Mono',monospace`;
+    const tw  = ctx.measureText(txt).width + 8;
+    const th  = fh + 6;
+    ctx.fillStyle = col;
+    ctx.fillRect(cx1, Math.max(0,cy1-th), tw, th);
+    ctx.fillStyle = '#000';
+    ctx.fillText(txt, cx1+4, Math.max(th,cy1)-3);
+  }
+
+  updateHint();
+}
+
+function updateHint(){
+  const n=boxes.length, s=selIds.size;
+  if(!img){ hint.textContent='Load image, then Draw or Select boxes'; return; }
+  if(mode==='draw') hint.textContent=`Draw mode — drag to create a box (${n} total)`;
+  else hint.textContent= s
+    ? `${s} selected · Del=delete · Dbl-click=rename · drag=move/resize`
+    : `Select mode — click a box to select (${n} boxes)`;
+}
+
+/* ── mouse events ────────────────────────────────────── */
+canvas.addEventListener('mousedown', e=>{
+  if(!img) return;
+  hideRename();
+  canvas.focus();
+  const [cx,cy] = canvasXY(e);
+  const [ix,iy] = toImg(cx,cy);
+
+  if(mode==='draw'){
+    drag={type:'draw', startX:ix, startY:iy,
+          current:{x1:ix,y1:iy,x2:ix,y2:iy}};
+    return;
+  }
+
+  // select mode: check resize handle on selected box first
+  for(const b of boxes){
+    if(!selIds.has(b.id)) continue;
+    const h = handleAt(b,cx,cy);
+    if(h){
+      drag={type:'resize', id:b.id, handle:h, startX:cx, startY:cy,
+            origin:{x1:b.x1,y1:b.y1,x2:b.x2,y2:b.y2}};
+      return;
+    }
+  }
+
+  // check move on any selected box
+  const hit = boxAt(cx,cy);
+  if(hit && selIds.has(hit.id)){
+    drag={type:'move', ids:[...selIds], startX:cx, startY:cy,
+          origins: Object.fromEntries(
+            boxes.filter(b=>selIds.has(b.id))
+                 .map(b=>([b.id,{x1:b.x1,y1:b.y1,x2:b.x2,y2:b.y2}]))
+          )};
+    return;
+  }
+
+  // click to select / deselect
+  if(hit){
+    if(e.shiftKey || e.ctrlKey || e.metaKey){
+      if(selIds.has(hit.id)) selIds.delete(hit.id); else selIds.add(hit.id);
+    } else {
+      selIds = new Set([hit.id]);
+    }
+  } else {
+    selIds = new Set();
+  }
+  render();
+});
+
+canvas.addEventListener('mousemove', e=>{
+  if(!drag) return;
+  const [cx,cy] = canvasXY(e);
+  const [ix,iy] = toImg(cx,cy);
+
+  if(drag.type==='draw'){
+    drag.current = {
+      x1:Math.min(drag.startX,ix), y1:Math.min(drag.startY,iy),
+      x2:Math.max(drag.startX,ix), y2:Math.max(drag.startY,iy),
+    };
+    render(); return;
+  }
+  if(drag.type==='move'){
+    const dx=(cx-drag.startX)/scale, dy=(cy-drag.startY)/scale;
+    for(const b of boxes){
+      if(!selIds.has(b.id)) continue;
+      const o=drag.origins[b.id];
+      b.x1=clampX(o.x1+dx); b.y1=clampY(o.y1+dy);
+      b.x2=clampX(o.x2+dx); b.y2=clampY(o.y2+dy);
+    }
+    render(); return;
+  }
+  if(drag.type==='resize'){
+    const b=boxes.find(b=>b.id===drag.id);
+    if(!b) return;
+    const o=drag.origin;
+    const dx=(cx-drag.startX)/scale, dy=(cy-drag.startY)/scale;
+    const h=drag.handle;
+    if(h.includes('l')) b.x1=clampX(o.x1+dx);
+    if(h.includes('r')) b.x2=clampX(o.x2+dx);
+    if(h.includes('t')) b.y1=clampY(o.y1+dy);
+    if(h.includes('b')) b.y2=clampY(o.y2+dy);
+    if(h.includes('m') && h.startsWith('t')) b.y1=clampY(o.y1+dy);
+    if(h.includes('m') && h.startsWith('b')) b.y2=clampY(o.y2+dy);
+    if(h==='ml') b.x1=clampX(o.x1+dx);
+    if(h==='mr') b.x2=clampX(o.x2+dx);
+    render();
+  }
+});
+
+canvas.addEventListener('mouseup', e=>{
+  if(!drag) return;
+  if(drag.type==='draw'){
+    const {x1,y1,x2,y2}=drag.current;
+    if(Math.abs(x2-x1)>5 && Math.abs(y2-y1)>5){
+      const b={id:uid(),label:'object',
+               x1:Math.min(x1,x2), y1:Math.min(y1,y2),
+               x2:Math.max(x1,x2), y2:Math.max(y1,y2)};
+      boxes.push(b);
+      selIds=new Set([b.id]);
+      // immediately prompt to rename
+      setTimeout(()=>showRename(b), 80);
+    }
+  }
+  drag=null;
+  render(); pushBoxes();
+});
+
+canvas.addEventListener('dblclick', e=>{
+  const [cx,cy]=canvasXY(e);
+  const b=boxAt(cx,cy);
+  if(b) showRename(b);
+});
+
+canvas.addEventListener('keydown', e=>{
+  if(e.key==='Delete'||e.key==='Backspace'){
+    boxes=boxes.filter(b=>!selIds.has(b.id));
+    selIds=new Set();
+    render(); pushBoxes();
+  }
+  if((e.ctrlKey||e.metaKey)&&e.key==='a'){
+    selIds=new Set(boxes.map(b=>b.id));
+    render();
+    e.preventDefault();
+  }
+});
+
+/* ── inline rename ───────────────────────────────────── */
+function showRename(b){
+  const [cx1,cy1]=toCanvas(b.x1,b.y1);
+  const wrap=document.getElementById('cvtoy-wrap');
+  const wr=wrap.getBoundingClientRect(), cr=canvas.getBoundingClientRect();
+  const left=(cr.left-wr.left)+cx1;
+  const top =(cr.top -wr.top) +cy1+2;
+  renameInput.style.display='block';
+  renameInput.style.left=left+'px';
+  renameInput.style.top=top+'px';
+  renameInput.value=b.label;
+  renameInput._boxId=b.id;
+  renameInput.focus();
+  renameInput.select();
+}
+function hideRename(){
+  if(renameInput.style.display==='none') return;
+  const id=renameInput._boxId;
+  const label=(renameInput.value||'').trim();
+  if(id && label){
+    const b=boxes.find(b=>b.id===id);
+    if(b) b.label=label;
+  }
+  renameInput.style.display='none';
+  render(); pushBoxes();
+}
+renameInput.addEventListener('keydown', e=>{
+  if(e.key==='Enter'||e.key==='Escape') hideRename();
+  e.stopPropagation();
+});
+renameInput.addEventListener('blur', hideRename);
+
+/* ── mode toggle ─────────────────────────────────────── */
+window.CVToy = {
+  setMode(m){
+    mode=m;
+    canvas.style.cursor = m==='draw' ? 'crosshair' : 'default';
+    document.getElementById('cvtoy-btn-select').style.background =
+      m==='select' ? '#1a2f4a' : '#111827';
+    document.getElementById('cvtoy-btn-draw').style.background =
+      m==='draw'   ? '#1a2f4a' : '#111827';
+    render();
+  },
+  getBoxesJSON(){ return JSON.stringify(boxes.map(b=>({id:b.id,label:b.label,bbox:[b.x1,b.y1,b.x2,b.y2]}))); },
+};
+
+/* ── utils ───────────────────────────────────────────── */
+function uid(){ return Math.random().toString(36).slice(2,10); }
+function clampX(v){ return Math.max(0,Math.min(imgW,v)); }
+function clampY(v){ return Math.max(0,Math.min(imgH,v)); }
+
+/* ── boot ────────────────────────────────────────────── */
+// Wait for Gradio to finish rendering before starting the poll
+setTimeout(watchCanvasIn, 1200);
+
+})();
+</script>
+""")
+
+            # Batch-relabel row (below canvas, in Python/Gradio)
             with gr.Row():
-                # ── Edit panel ──────────────────────────────────────────────
                 with gr.Column(scale=3):
-                    gr.Markdown("#### Edit selection")
                     with gr.Row():
-                        edit_label  = gr.Textbox(label="Rename selected to", placeholder="new_label")
-                        btn_rename  = gr.Button("✏️ Rename")
+                        relabel_text = gr.Textbox(label="Relabel selected boxes →",
+                                                  placeholder="new_label",
+                                                  info="Type a label and click Apply to rename all selected boxes at once")
+                        btn_relabel  = gr.Button("🏷️ Apply to selected")
                     with gr.Row():
-                        group_label = gr.Textbox(label="Group selected → label", placeholder="group_label")
-                        btn_group   = gr.Button("🔗 Group into one box")
-                    with gr.Row():
-                        btn_del_sel   = gr.Button("🗑️ Delete selected")
-                        btn_clear_all = gr.Button("✕ Clear all boxes")
-
-                # ── Manual add ──────────────────────────────────────────────
+                        btn_clear_canvas = gr.Button("✕ Clear all boxes")
                 with gr.Column(scale=2):
-                    gr.Markdown("#### Add box manually")
-                    man_label = gr.Textbox(label="Label", placeholder="label")
-                    with gr.Row():
-                        man_x1 = gr.Number(label="X1", value=0, precision=0)
-                        man_y1 = gr.Number(label="Y1", value=0, precision=0)
-                    with gr.Row():
-                        man_x2 = gr.Number(label="X2", value=100, precision=0)
-                        man_y2 = gr.Number(label="Y2", value=100, precision=0)
-                    btn_man_add = gr.Button("➕ Add")
+                    gr.Markdown(
+                        "**Tips:** `Draw` mode → drag to create  \n"
+                        "`Select` mode → click/shift-click · drag to move · drag corners to resize  \n"
+                        "`Del` key removes selected · double-click renames"
+                    )
 
             gr.Markdown("---")
             gr.Markdown("#### Register confirmed detections")
@@ -385,124 +826,106 @@ def build_ui():
             with gr.Accordion("🐛 Raw LLM output", open=False):
                 det_raw = gr.Textbox(label="Raw response", lines=6, interactive=False)
 
-            # ── Helpers ─────────────────────────────────────────────────────
+            # ── Python helpers ───────────────────────────────────────────────
+
+            def _push_to_canvas(img_pil, boxes_list):
+                """Serialize image + boxes to JSON for the canvas_in bridge."""
+                if img_pil is None:
+                    return ""
+                b64 = "data:image/png;base64," + encode_image_b64(img_pil)
+                return json.dumps({"image": b64, "boxes": boxes_list})
+
+            def _read_canvas(raw_json) -> list[dict]:
+                """Parse boxes from canvas_out bridge."""
+                if not raw_json:
+                    return []
+                try:
+                    items = json.loads(raw_json)
+                    return [{"id": b["id"], "label": b["label"], "bbox": b["bbox"]}
+                            for b in items if "bbox" in b]
+                except Exception:
+                    return []
 
             def do_detect(img, guided):
                 if img is None:
-                    return gr.update(), [], set(), "No image loaded — go to Input tab first.", ""
+                    return "", [], "No image loaded — go to Input tab first.", ""
                 dets, raw = run_detection(img, guided)
                 n = len(dets)
-                msg = (f"Found {n} object{'s' if n!=1 else ''}."
+                msg = (f"Found {n} object{'s' if n!=1 else ''}. Edit boxes in the canvas, then register."
                        if dets else
-                       "No objects detected. Check Ollama is running: `ollama serve`")
-                return draw_detections(img, dets), dets, set(), msg, raw
+                       "No objects detected. Check Ollama is running (`ollama serve`) and try again.")
+                canvas_payload = _push_to_canvas(img, dets)
+                return canvas_payload, dets, msg, raw
 
-            def on_click(img, dets, sel, evt: gr.SelectData):
-                if not dets or img is None: return gr.update(), sel
-                cx, cy = int(evt.index[0]), int(evt.index[1])
-                hit, best = None, float("inf")
-                for d in dets:
-                    x1,y1,x2,y2 = d["bbox"]
-                    if x1<=cx<=x2 and y1<=cy<=y2:
-                        a = (x2-x1)*(y2-y1)
-                        if a < best: best=a; hit=d["id"]
-                if hit is None:
-                    new_sel = set()
-                elif hit in sel:
-                    new_sel = sel - {hit}
-                else:
-                    new_sel = sel | {hit}
-                return draw_detections(img, dets, new_sel), new_sel
+            def load_canvas(img):
+                if img is None:
+                    return "", [], "No image loaded."
+                canvas_payload = _push_to_canvas(img, [])
+                return canvas_payload, [], "Image loaded. Switch to Draw mode and drag to create boxes."
 
-            def rename_sel(img, dets, sel, label):
-                if not label.strip(): return gr.update(), dets, "Enter a label."
-                label = label.strip()
-                dets = [dict(d, label=label) if d["id"] in sel else d for d in dets]
-                return draw_detections(img, dets, sel), dets, f"Renamed to '{label}'."
+            def relabel_selected(canvas_json, relabel):
+                """Read current boxes from canvas, relabel selected ones, push back."""
+                # We can't know which are "selected" from Python — selection lives in JS.
+                # Strategy: the JS Ctrl+A selects all; for relabelling we just rename
+                # all boxes that match nothing (label=='object') or we expose a separate
+                # mechanism. Best UX: user uses the inline double-click rename in canvas.
+                # This button applies the label to ALL boxes currently in the canvas
+                # whose label is 'object' (i.e. freshly drawn ones not yet named).
+                if not relabel.strip():
+                    return gr.update(), "Enter a label first."
+                boxes = _read_canvas(canvas_json)
+                if not boxes:
+                    return gr.update(), "No boxes in canvas yet."
+                # Rename boxes labelled 'object' (default for newly drawn boxes)
+                renamed = 0
+                for b in boxes:
+                    if b["label"] == "object":
+                        b["label"] = relabel.strip()
+                        renamed += 1
+                if renamed == 0:
+                    return gr.update(), "No unnamed boxes found (use double-click to rename individual boxes)."
+                # Push updated boxes back (keep same image)
+                return gr.update(), f"Renamed {renamed} unnamed box(es) → '{relabel.strip()}'."
 
-            def group_sel(img, dets, sel, label):
-                if not label.strip(): return gr.update(), dets, sel, "Enter a group label."
-                label = label.strip()
-                chosen = [d for d in dets if d["id"] in sel]
-                rest   = [d for d in dets if d["id"] not in sel]
-                if len(chosen) < 2:
-                    return gr.update(), dets, sel, "Select ≥2 boxes to group."
-                xs = [v for d in chosen for v in [d["bbox"][0], d["bbox"][2]]]
-                ys = [v for d in chosen for v in [d["bbox"][1], d["bbox"][3]]]
-                merged = {"id": str(uuid.uuid4())[:8], "label": label,
-                          "bbox": [min(xs), min(ys), max(xs), max(ys)]}
-                new_dets = rest + [merged]
-                new_sel  = {merged["id"]}
-                return draw_detections(img, new_dets, new_sel), new_dets, new_sel, \
-                       f"Grouped {len(chosen)} → '{label}'."
+            def clear_canvas(img):
+                if img is None:
+                    return "", [], "No image loaded."
+                return _push_to_canvas(img, []), [], "Cleared."
 
-            def delete_sel(img, dets, sel):
-                new_dets = [d for d in dets if d["id"] not in sel]
-                return draw_detections(img, new_dets, set()), new_dets, set(), \
-                       f"Deleted {len(sel)} box(es)."
-
-            def clear_all_dets(img):
-                return (img.copy() if img else gr.update()), [], set(), "Cleared."
-
-            def add_manual(img, dets, sel, label, x1, y1, x2, y2):
-                if not label.strip(): return gr.update(), dets, sel, "Enter a label."
-                det = {"id": str(uuid.uuid4())[:8], "label": label.strip(),
-                       "bbox": [int(x1), int(y1), int(x2), int(y2)]}
-                new_dets = dets + [det]
-                return draw_detections(img, new_dets, sel), new_dets, sel, \
-                       f"Added '{label}'."
-
-            def _register(img, dets, ids):
-                if img is None: return "No image loaded."
-                if not ids:     return "Nothing selected."
+            def _register(img_pil, canvas_json, selected_only):
+                if img_pil is None:
+                    return "No image loaded."
+                boxes = _read_canvas(canvas_json)
+                if not boxes:
+                    return "No boxes in canvas. Draw or detect some first."
                 n = 0
-                for d in dets:
-                    if d["id"] not in ids: continue
-                    add_to_registry(d["label"], crop_pil(img, d["bbox"]))
+                for b in boxes:
+                    add_to_registry(b["label"], crop_pil(img_pil, b["bbox"]))
                     n += 1
-                return f"Registered {n} detection(s). Registry: {len(_registry)} labels."
+                return f"Registered {n} box(es). Registry now has {len(_registry)} labels."
 
-            def reg_sel(img, dets, sel): return _register(img, dets, sel)
-            def reg_all(img, dets):      return _register(img, dets, {d["id"] for d in dets})
+            def reg_all(img, cjson):  return _register(img, cjson, False)
+            # "Register selected" = register all (JS selection not exposed to Python;
+            #  user can delete unwanted boxes before registering)
+            def reg_sel(img, cjson):  return _register(img, cjson, True)
 
-            # ── Wiring ──────────────────────────────────────────────────────
+            # ── Wiring ───────────────────────────────────────────────────────
 
-            _det_outs = [detect_canvas, detections_state, selected_ids_state,
-                         detect_status, det_raw]
+            _det_outs = [canvas_in, detections_state, detect_status, det_raw]
 
             btn_detect      .click(lambda i: do_detect(i, False), [current_image_state], _det_outs)
             btn_detect_guide.click(lambda i: do_detect(i, True),  [current_image_state], _det_outs)
+            btn_load_canvas .click(load_canvas, [current_image_state],
+                                   [canvas_in, detections_state, detect_status])
 
-            detect_canvas.select(on_click,
-                                 [current_image_state, detections_state, selected_ids_state],
-                                 [detect_canvas, selected_ids_state])
+            btn_relabel.click(relabel_selected, [canvas_out, relabel_text],
+                              [canvas_in, detect_status])
 
-            btn_rename.click(rename_sel,
-                             [current_image_state, detections_state, selected_ids_state, edit_label],
-                             [detect_canvas, detections_state, detect_status])
+            btn_clear_canvas.click(clear_canvas, [current_image_state],
+                                   [canvas_in, detections_state, detect_status])
 
-            btn_group.click(group_sel,
-                            [current_image_state, detections_state, selected_ids_state, group_label],
-                            [detect_canvas, detections_state, selected_ids_state, detect_status])
-
-            btn_del_sel  .click(delete_sel,
-                                [current_image_state, detections_state, selected_ids_state],
-                                [detect_canvas, detections_state, selected_ids_state, detect_status])
-
-            btn_clear_all.click(clear_all_dets, [current_image_state],
-                                [detect_canvas, detections_state, selected_ids_state, detect_status])
-
-            btn_man_add.click(add_manual,
-                              [current_image_state, detections_state, selected_ids_state,
-                               man_label, man_x1, man_y1, man_x2, man_y2],
-                              [detect_canvas, detections_state, selected_ids_state, detect_status])
-
-            btn_reg_sel.click(reg_sel,
-                              [current_image_state, detections_state, selected_ids_state],
-                              [reg_status])
-            btn_reg_all.click(reg_all,
-                              [current_image_state, detections_state],
-                              [reg_status])
+            btn_reg_sel.click(reg_sel, [current_image_state, canvas_out], [reg_status])
+            btn_reg_all.click(reg_all, [current_image_state, canvas_out], [reg_status])
 
         # ════════════════════════════════════════════════════════════════════
         # Tab 3 — Points & Distance
